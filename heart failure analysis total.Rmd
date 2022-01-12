@@ -1,0 +1,591 @@
+---
+title: "Heart Failure Analysis, Part 1"
+author: "Doc Larry"
+date: "October 8, 2020"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+---
+
+# Introduction
+
+This analysis forecasts the number of diagnoses and admissions for heart failure.
+
+Three units of analysis (UA):  hospital, state, county
+Two dependent variables:  number of diagnoses (hospital UA), admission rate (state & county)
+
+Methods:
+OLS, Lasso, enet, RF, extra trees, gradient boosting, bagging, hospital UA
+OLS, Lasso, enet, GIS for admission rates at state and county UA.
+
+Software:
+Python 3.8
+R Version 4.0.2
+R Studio IDE
+
+
+# Setup
+
+Load the printing functions and all libraries
+
+```{r message=FALSE}
+#############################################################################
+knitr::opts_chunk$set(echo = TRUE)    
+library(Amelia)
+library(car)
+library(caret)
+library(clusterGeneration)
+library(corrplot)
+library(covTest)
+library(elsa)        
+library(factoextra)
+library(fpp2)
+library(ggcorrplot)
+library(ggExtra)     
+library(ggplot2)
+library(glmnet)
+library(glmpath)     
+library(grid)        
+library(gridExtra)
+library(hts)
+library(kableExtra)
+library(knitr)
+library(lars)        
+library(lattice)
+library(latticeExtra)
+library(leaflet)     
+library(leaps)
+library(lmSupport)   
+library(maptools)    
+library(MASS)
+library(mice)
+library(NbClust)
+library(psych)
+library(QuantPsyc)
+library(raster)      
+library(RColorBrewer)
+library(ResourceSelection)
+library(reticulate)
+library(rgdal)       
+library(rgeos)       
+library(scales)
+library(sf)          
+library(shiny)       
+library(sp)          
+library(spatialEco)
+library(spatialreg)  
+library(spData)      
+library(spdep)       
+library(tidyverse)
+library(totalcensus)
+library(tmap)        
+library(tmaptools)   
+library(usmap)       
+library(viridis)
+library(xgboost)
+#############################################################################
+print("Set up >50 R Libraries...")
+```
+
+# Environment Set Up
+
+```{r environ}
+
+#############################################################################
+Sys.setenv('RETICULATE_PYTHON'='C://ProgramData//Anaconda3//')
+use_python('C://ProgramData//Anaconda3//python.exe')
+use_condaenv("base") 
+py$RANDOM_SEED = 1234
+matplotlib=import('matplotlib.pyplot')
+options(scipen=9); options(digits=3)
+#############################################################################
+print("Invoked Python 3.8...")
+
+```
+
+# Functions
+
+```{r genfunctions}
+
+################################PRINT########################################
+myprint=function(x,nm) {
+  x%>%kbl(col.names = nm)%>%kable_classic(full_width = F, html_font = "Cambria")}
+#############################################################################
+
+##############################COREELATION####################################
+corfunction=function(d){
+  mycorr=cor(d[, 1:ncol(d)]); p.mat=cor_pmat(d[,1:ncol(d)])
+  myplot=ggcorrplot(mycorr, hc.order=TRUE,type="lower",colors=c("red", "white","green"),tl.cex = 8, tl.col = "black", lab=TRUE, lab_size=3, p.mat=p.mat, insig="pch", pch=4)
+  print(myplot)}
+#############################################################################
+
+#################################SCALE#######################################
+myscale=function(x) {(x-min(x))/(max(x)-min(x))}
+#############################################################################
+
+print("Set up functions for use...")
+
+```
+
+
+# Read the Data
+
+```{r read}
+
+#############################################################################
+mycsv=read.csv("C:/Users/Lawrence Fulton/OneDrive - Texas State University/D_Drive/Heart/thf5.csv", stringsAsFactors = TRUE)
+#############################################################################
+
+print("Read the data...")
+
+```
+
+# Delete Rows
+
+```{r deleterows}
+
+#############################################################################
+missmap(mycsv)
+mycsv$na_count = apply(mycsv, 1, function(x) sum(is.na(x))) #count NA's
+mycsv=mycsv[mycsv$na_count<5,] #delete columns with 5 or more NAs (33%)
+mycsv$na_count=NULL #remove count variable
+#############################################################################
+
+print("Deleting largely empty rows..")
+```
+
+# Completeness by Column
+
+```{r checkcompleteness}
+
+#############################################################################
+myprint(sort(apply(mycsv,2,function(x) sum(is.na(x))/length(x))), "Missing")
+#############################################################################
+
+```
+
+# Train and Test Set
+
+```{r traintestsplit}
+
+#############################################################################
+set.seed(1234) #set a pseudo-random number
+mys=sort(sample(1:nrow(mycsv),.2*nrow(mycsv), replace=FALSE))#sample 20%
+train=mycsv[-mys,]; test=mycsv[mys,] #test set is that 20%
+#############################################################################
+print("Make training and test sets for model building...")
+
+```
+
+# Impute the Missing
+
+```{r impute}
+
+#############################################################################
+for(i in 1:13){ #replace 1% missing with means
+  mycsv[is.na(mycsv[,i]), i] <- mean(mycsv[,i], na.rm = TRUE) 
+  train[is.na(train[,i]), i] <- mean(train[,i], na.rm = TRUE) 
+  test[is.na(test[,i]), i] <- mean(test[,i], na.rm = TRUE)    }
+missmap(mycsv)
+#############################################################################
+
+```
+
+# Describe the Data
+
+We provide descriptive statistics by year and overall using the total dataset.
+
+```{r describe}
+
+#############################################################################
+mydescribe=function(x,y){describe(x)%>%kbl(caption=y)%>%kable_classic(full_width = F, html_font = "Cambria")}
+mydescribe(mycsv[mycsv$Year_=='Y16',],'Year 2016')
+mydescribe(mycsv[mycsv$Year_=='Y17',], 'Year 2017')
+mydescribe(mycsv[mycsv$Year_=='Y18',], 'Year 2018')
+mydescribe(mycsv, 'All Years')
+#############################################################################
+
+```
+
+# Graphs
+
+## Boxplots for Affilation Data
+
+```{r}
+m=10000
+myp1=ggplot(mycsv[mycsv$Year_=="Y16",], aes(x=reorder(Medical_School_Affiliation_,Diagnoses, median), y=Diagnoses, color=Medical_School_Affiliation_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2016", labels = comma, limits=c(0,m))
+
+myp2=ggplot(mycsv[mycsv$Year_=="Y17",], aes(x=reorder(Medical_School_Affiliation_,Diagnoses, median), y=Diagnoses, color=Medical_School_Affiliation_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2017", labels = comma, limits=c(0,m))
+
+myp3=ggplot(mycsv[mycsv$Year_=="Y18",], aes(x=reorder(Medical_School_Affiliation_,Diagnoses, median), y=Diagnoses, color=Medical_School_Affiliation_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2018", labels = comma, limits=c(0,m))
+
+grid.arrange(myp1,myp2,myp3)
+
+
+```
+
+## Boxplots for Type Data
+
+```{r}
+m=10000
+myp1=ggplot(mycsv[mycsv$Year_=="Y16",], aes(x=reorder(Ownership_,Diagnoses, median), y=Diagnoses, color=Ownership_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2016", labels = comma, limits=c(0,m))
+
+myp2=ggplot(mycsv[mycsv$Year_=="Y17",], aes(x=reorder(Ownership_,Diagnoses, median), y=Diagnoses, color=Ownership_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2017", labels = comma, limits=c(0,m))
+
+myp3=ggplot(mycsv[mycsv$Year_=="Y18",], aes(x=reorder(Ownership_,Diagnoses, median), y=Diagnoses, color=Ownership_))+
+  geom_boxplot(notch=TRUE)+
+  theme(legend.position = "none")+
+  xlab("")+
+  coord_flip()+
+  scale_y_continuous(name="Year 2018", labels = comma, limits=c(0,m))
+
+grid.arrange(myp1,myp2,myp3)
+
+
+```
+
+## Barplots
+
+```{r barplots}
+
+#############################################################################
+mynames=names(mycsv) #get the names for the data
+for (i in 14:20){
+  p = ggplot(data = mycsv, aes(x = mycsv[,i], fill=Year_))+   geom_bar(stat='count')+facet_grid(~Year_, scale='free_x')+ ggtitle(mynames[i])+ xlab('')+ylab('Count')+ coord_flip() + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  print(p)
+  barplot(sort(table(mycsv[, i]), decreasing = FALSE), main=mynames[i], col="red", horiz=TRUE, las=2, cex.names=.5)
+} 
+#############################################################################
+
+```
+
+# Correlations Pre-Transform
+
+We investigate hierarchically clustered correlation plots
+
+```{r correlation1}
+
+#############################################################################
+corfunction(mycsv[, 1:13])
+#############################################################################
+
+```
+
+# Generate Principal Components
+
+
+```{r}
+
+#############################################################################
+totalpc=prcomp(mycsv[, 6:11], center=TRUE, scale=TRUE, retx=TRUE)
+trainpc=prcomp(train[, 6:11], center=TRUE, scale=TRUE, retx=TRUE)
+checkvar=data.frame('Total PC'=totalpc$sdev^2/sum(totalpc$sdev^2), 'TrainPC'= trainpc$sdev^2/sum(trainpc$sdev^2))
+row.names(checkvar)=c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6")
+colnames(checkvar)=c("%Var, Total Data", "%Var, Training Dat")
+myprint(checkvar,colnames(checkvar))
+mycsv$PC1=totalpc$x[,1]; train$PC1=trainpc$x[,1]
+test$PC1=predict(trainpc, newdata=test[,6:11])[,1] #Predict Test with Training
+mycsv[,6:11]=train[,6:11]=test[,6:11]=NULL
+#############################################################################
+
+```
+# Re-order &  Re-check Correlations
+
+```{r}
+
+#############################################################################
+corfunction(mycsv[, 1:7,15])
+mycsv=mycsv[,c(1,15,2:14)] 
+train=train[,c(1,15,2:14)]
+test=test[,c(1,15,2:14)]
+#############################################################################
+
+```
+
+# Scale for Analysis
+
+
+```{r scale}
+
+#############################################################################
+for (i in c(1:8)){mycsv[,i]=myscale(mycsv[,i])
+train[,i]=myscale(train[,i]) #update training set
+test[,i]=myscale(test[,i])} #update test set
+#############################################################################
+describe(mycsv[, 1:8])%>%kbl()%>%kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+
+# Python Libraries
+
+```{python message=FALSE}
+
+#############################################################################
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+import gc
+import sklearn.linear_model   #Need the linear model components
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor as RFR # Random Forest package
+from sklearn.ensemble import ExtraTreesRegressor as ETR # Extra Trees package
+from sklearn.ensemble import BaggingRegressor as BR 
+from sklearn.model_selection import train_test_split as tts
+#from sklearn.model_selection import RandomizedSearchCV as RSCV
+from xgboost import XGBRegressor as XGB
+from sklearn.linear_model import Ridge
+from sklearn.linear_model import Lasso
+from sklearn.linear_model import ElasticNet 
+from sklearn.linear_model import LinearRegression as OLS
+from sklearn.metrics import mean_squared_error, r2_score # evaluation metrics
+#############################################################################
+print("Loaded 20 or so Python libraries...")
+
+```
+
+# Read Data for Python
+
+```{python readpy}
+
+#############################################################################
+mydata, train, test = r.mycsv, r.train,r.test
+mydata, train, test=pd.get_dummies(mydata), pd.get_dummies(train), pd.get_dummies(test)
+mynames=mydata.columns
+xtrain, ytrain, xtest, ytest =train.iloc[:, 1:len(train.columns)], train.iloc[:,0], test.iloc[:, 1:len(test.columns)], test.iloc[:,0]
+xtot, ytot=mydata.iloc[:, 1:len(mydata.columns)], mydata.iloc[:,]
+#############################################################################
+print("Read in R full, train, test data...")
+
+```
+
+
+# Initial ML Models
+
+
+```{python ML1}
+
+t1=OLS(n_jobs=-1)
+t2=RFR(n_estimators = 50, criterion='mse',n_jobs = -1, random_state = 1234)
+t3=ETR(n_estimators = 50,criterion='mse', n_jobs = -1, random_state = 1234)
+t4=XGB(n_estimators=50, n_jobs=-1,learning_rate=0.1, max_depth=15,objective='reg:squarederror', random_state=1234) 
+t5=BR(n_estimators=50, random_state=1234)
+
+def myf(x,name):
+    temp=x.fit(xtrain,ytrain)
+    print(name,": ", round(temp.score(xtest, ytest),4))
+    
+myf(t1, 'OLS')
+myf(t2, 'RFR')
+myf(t3, 'ETR')
+myf(t4, 'XGB')
+myf(t5, 'BR')
+
+#############################################################################
+
+```
+
+# Prediction with Best Model Post-Tuning
+
+```{python ML2}
+
+#############################################################################
+model=ETR(n_estimators = 200, max_depth=70,n_jobs=-1, random_state=1234)  
+modelfit=model.fit(xtrain, ytrain)
+mypred=model.predict(xtest)
+mynames=mydata.columns
+print(modelfit.score(xtest,ytest))
+tempdata={'Variable':mynames[1:len(mynames)],'Importance':modelfit.feature_importances_}
+#############################################################################
+
+```
+
+# Descending in Order for Importance
+
+```{python}
+
+#############################################################################
+a=pd.DataFrame(modelfit.feature_importances_)
+a.index, a.columns=mynames[1:len(mynames)],["Importance"]
+a.sort_values(by=['Importance'], ascending=False,inplace=True)
+#############################################################################
+print("Sort variables in order of importance...")
+
+```
+
+# Barplot of Importances
+
+```{r}
+
+#############################################################################
+imp=reticulate::py$a$Importance
+impnames=factor(c("STAC", "PC", "DRG293", "UT", "LTAC"), levels=c("STAC", "PC", "DRG293", "UT", "LTAC"))
+tempdf=data.frame(Name=impnames[1:5], Importance=imp[1:5])
+
+ggplot(tempdf, aes(x=Name, y=Importance, fill=Name)) +   geom_bar(stat = "identity") + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),axis.title.x = element_blank())+ geom_text(aes(label=round(Importance,3)), position=position_dodge(width=0.9), vjust=-0.25)
+#############################################################################
+
+```
+
+# Regression Models, Hospital Unit of Analysis
+
+Next, we build a train regression and evaluate on test set.
+
+```{r}
+
+#############################################################################
+fullOLS=lm(Diagnoses~., data=train)
+mylm=summary(fullOLS); myres=residuals(fullOLS); mypred=predict(fullOLS, test)
+testfit=lm(test$Diagnoses~mypred); mysum=summary(testfit)
+ans=c(mylm$r.squared, mysum$r.squared);names(ans)=c("Train", "Test")
+ans%>%kbl(col.names="R2")%>%kable_classic(full_width = F, html_font = "Cambria")
+#############################################################################
+
+```
+
+# Regression Residual Plot
+
+```{r resplot}
+
+#############################################################################
+layout(mat = matrix(c(1,2),2,1, byrow=TRUE),  height = c(1,8))
+par(mar=c(0, 3.1, 1.1, 2.1))
+boxplot(myres, horizontal=TRUE, main="", xaxt="n", col="red")
+par(mar=c(4, 3.1, 1.1, 2.1))
+hist(myres, main="", xlab="", col="blue")
+#############################################################################
+
+```
+
+# Complete Regression Model on Entire Dataset
+
+```{r totalregress}
+
+#############################################################################
+mylmfinal=lm(Diagnoses~., data=mycsv) #build full regression
+mysummary=summary(mylmfinal)
+ans=c(mylm$r.squared, mysum$r.squared, mysummary$r.squared); names(ans)=c("Train", "Test", "Full")
+ans%>%kbl(col.names="R2")%>%kable_classic(full_width = F, html_font = "Cambria")
+summary(aov(mylmfinal))
+#############################################################################
+
+```
+
+
+# Function for R2
+
+```{r r2calc}
+
+#############################################################################
+myr2=function(pred, actual){
+  rss =sum((pred - actual) ^ 2); tss = sum((actual - mean(actual)) ^ 2)
+  rsq = 1 - rss/tss; names(rsq)="R2"; return(rsq) }
+#############################################################################
+
+```
+
+
+# Evaluate LASSO
+
+```{r lasso}
+
+#############################################################################
+lambda_seq=10^seq(2, -2, by = -.1)
+
+#Train Data
+x=model.matrix(Diagnoses~. , train)[,-1]; y=train$Diagnoses
+#Test Data
+x2=model.matrix(Diagnoses~., test)[,-1]; y2=test$Diagnoses
+#Total Data
+x3=model.matrix(Diagnoses~., mycsv)[,-1]; y3=mycsv$Diagnoses
+mynames=colnames(x3)
+
+#Best Lambda
+best_lam=cv.glmnet(x,y, alpha = 1, lambda = lambda_seq)$lambda.min
+names(best_lam)="Best Lambda"
+
+#Model and Predictions
+lasso=glmnet(x,y,alpha = 1, lambda = best_lam)
+pred1=predict(lasso, s = best_lam, newx=x)
+pred2=predict(lasso, s = best_lam, newx=x2)
+pred3=predict(lasso, s=best_lam, newx=x3)
+t1=myr2(pred1,y); t2=myr2(pred2,y2); t3=myr2(pred3,y3);t4=best_lam
+ans=c(t1,t2,t3,t4);names(ans)=c("Train", "Test", "Full", "Best Lambda")
+ans%>%kbl(col.names="R2")%>%kable_classic(full_width = F, html_font = "Cambria")
+lasso=glmnet(x3,y3, alpha=1, lambda=.01)
+#############################################################################
+
+```
+
+# Evaluate Elasticnet
+
+
+```{r enet}
+
+#############################################################################
+myenet=cv.glmnet(x,y,alpha = .5, lambda = lambda_seq, relaxed=TRUE)
+best_lam=myenet$lambda.min
+names(best_lam)="Best Lambda"
+enet=glmnet(x,y, alpha = .5, lambda = best_lam, gamma=best_gam)
+pred3 <- predict(enet, s = best_lam, newx = x)
+pred4 <- predict(enet, s = best_lam, newx = x2)
+pred5 <- predict(enet, s = best_lam, newx = x3)
+t1=myr2(pred3,y); t2=myr2(pred4,y2); t3=myr2(pred5,y3); t4=best_lam
+ans=c(t1,t2,t3,t4);names(ans)=c("Train", "Test", "Full", "Best Lambda")
+ans%>%kbl(col.names="R2")%>%kable_classic(full_width = F, html_font = "Cambria")
+enet=glmnet(x3,y3, alpha = .5, lambda = best_lam)
+#############################################################################
+
+```
+
+# Combine Coefficient Estimates
+
+```{r all}
+
+#############################################################################
+LM=mysummary$coefficients[,1]; LM=c(LM[2:15],0, LM[16:74])
+PValueLM=mysummary$coefficients[,4]
+LASSO=as.vector(lasso$beta); ENET=as.vector(enet$beta)
+TOT=cbind(round(LM,3), round(LASSO,3), round(ENET, 3), round(PValueLM, 3))
+mydf1=as.data.frame(TOT)
+rownames(mydf1)=mynames
+colnames(mydf1)=c("OLS for p<.05","LASSO", "ENET", "P-Value OLS")
+mydf1%>% kbl()%>%kable_classic(full_width = F, html_font = "Cambria")
+#############################################################################
+
+```
+
+
+
